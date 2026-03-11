@@ -13,6 +13,156 @@ This repository contains a minimal telemetry schema and synthetic data generator
 python3 scripts/generate_telemetry.py --db data/telemetry.db --queries 50000 --days 3
 ```
 
+## Digna-style scenario engine
+
+Install dependencies:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+Run one 15-minute batch:
+
+```bash
+python scripts/scenario_engine.py --db data/telemetry.db --window-min 15 --lookback-days 30 run
+```
+
+Backfill historical windows:
+
+```bash
+python scripts/scenario_engine.py --db data/telemetry.db backfill --start 2026-03-01T00:00:00Z --end 2026-03-02T00:00:00Z
+```
+
+View anomaly and KPI report:
+
+```bash
+python scripts/scenario_engine.py --db data/telemetry.db report --since 2026-03-01T00:00:00Z
+```
+
+Create a Windows scheduled task (every 15 minutes):
+
+```powershell
+schtasks /Create /SC MINUTE /MO 15 /TN "TeradataScenarioEngine" /TR "python C:\Users\pran.gogoi\Documents\pythonprj\teradata-demo\scripts\scenario_engine.py --db C:\Users\pran.gogoi\Documents\pythonprj\teradata-demo\data\telemetry.db --window-min 15 --lookback-days 30 run" /F
+```
+
+## Live dashboard (Grafana + SQLite)
+
+The repo includes a pre-provisioned Grafana dashboard that reads:
+- `impact_kpis`
+- `anomaly_events`
+- `metric_timeseries`
+
+### Start dashboard
+
+```bash
+docker compose up -d
+```
+
+Open:
+- `http://localhost:3000`
+- login: `admin` / `admin`
+
+### Stop dashboard
+
+```bash
+docker compose down
+```
+
+### Dashboard behavior
+
+- Auto refresh: every `15s`
+- Default time range: last `24h`
+- Datasource: `Telemetry SQLite` (`frser-sqlite-datasource`)
+- Dashboard auto-loaded from `grafana/dashboards/teradata-workload-live.json`
+
+### Verify provisioning
+
+1. In Grafana, go to `Connections -> Data sources`, confirm `Telemetry SQLite` is present.
+2. Open `Dashboards` and confirm `Teradata Workload Live Dashboard` exists.
+3. Run one scenario batch:
+
+```bash
+python scripts/scenario_engine.py --db data/telemetry.db --window-min 15 --lookback-days 30 run
+```
+
+4. Refresh dashboard and confirm KPI/anomaly panels update.
+
+### Troubleshooting
+
+- `No data in panels`: ensure `data/telemetry.db` exists and scenario engine has produced rows.
+- `Datasource plugin missing`: restart with `docker compose down && docker compose up -d` to reinstall plugin.
+- `Unable to open database file`: if the DB was created in WAL mode, convert it before starting Grafana:
+
+```bash
+python -c "import sqlite3; conn=sqlite3.connect('data/telemetry.db'); print(conn.execute('PRAGMA wal_checkpoint(FULL)').fetchall()); print(conn.execute('PRAGMA journal_mode=DELETE').fetchone()); conn.close()"
+```
+
+- `Database locked/read errors`: stop other processes writing aggressively to DB, rerun scenario batch, then refresh.
+- `Stale dashboard`: check `Producer Staleness (minutes)` panel and verify scheduled task is running.
+
+## Streamlit demo (S2-only IO outlier screen)
+
+This demo focuses on a single scenario:
+- `S2` Detecting IO Outliers Early
+
+### Install and run
+
+```bash
+python -m pip install -r requirements.txt
+streamlit run scripts/demo_app.py
+```
+
+Open:
+- `http://localhost:8501`
+
+### Prerequisites
+
+Generate telemetry and scenario outputs first:
+
+```bash
+python scripts/generate_telemetry.py --db data/telemetry.db --queries 50000 --days 3
+python scripts/scenario_engine.py --db data/telemetry.db --window-min 15 --lookback-days 30 run
+```
+
+### What the demo shows
+
+- Top controls: `Dataset`, `Workload`, `Check (sum/avg)`, `Trend Line`.
+- Main chart: IO line + dynamic rolling percentile bands.
+- Outlier overlay: `S2` anomaly markers from `anomaly_events`.
+- Right summary card: latest timestamp, latest IO, expected baseline (`p50`), deviation, outlier count.
+- In-app theory: simple explanation of IO signal, band math, and S2 outlier logic.
+- Worked example: one recent outlier with nearby raw telemetry samples.
+- Raw telemetry tables:
+  - `dbc_dbqlogtbl` query-level samples
+  - `resusage_spma` system samples
+  - workload join slice (`dbc_dbqlogtbl` + `workload_map`)
+
+### Band semantics
+
+- Green zone: IO up to rolling `p90` (expected range).
+- Yellow zone: between rolling `p90` and `p99` (warning range).
+- Red zone: above rolling `p99` (critical range).
+
+### How to click and interpret a point
+
+1. Click any point on the IO chart.
+2. `Selected Point` panel updates with:
+   - selected timestamp/value
+   - percentile zone (`green/yellow/red`)
+   - nearest S2 outlier (if present)
+3. Set `Raw table window` to `clicked-point ± minutes` to drill down into telemetry around that point.
+
+### Troubleshooting click interactions
+
+- If clicking does nothing, install/update dependencies:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+- Ensure `streamlit-plotly-events` is installed in the same active `.venv` as Streamlit.
+- Use `Clear Selected Point` to reset drilldown state.
+
 ## Example analysis queries
 
 ```sql

@@ -1,0 +1,20 @@
+services:
+  grafana:
+    image: grafana/grafana:11.1.0
+    container_name: teradata-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_INSTALL_PLUGINS: frser-sqlite-datasource
+      GF_USERS_DEFAULT_THEME: light
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ./data:/opt/telemetry:ro
+      - grafana-storage:/var/lib/grafana
+
+volumes:
+  grafana-storage:
