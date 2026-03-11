@@ -43,7 +43,9 @@ def main() -> None:
     start = end - timedelta(days=args.days)
 
     conn = sqlite3.connect(args.db)
-    conn.execute("PRAGMA journal_mode = WAL")
+    # Use a dashboard-friendly journal mode so read-only consumers like Grafana
+    # can query the database reliably across host/container boundaries.
+    conn.execute("PRAGMA journal_mode = DELETE")
     init_db(conn, args.schema)
 
     # table metadata

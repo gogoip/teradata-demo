@@ -1,0 +1,11 @@
+pandas>=2.0
+numpy>=1.24
+scikit-learn>=1.4
+statsmodels>=0.14
+ruptures>=1.1
+streamlit>=1.32
+plotly>=5.22
+streamlit-plotly-events>=0.0.6
+langchain-core>=0.3
+langchain-groq>=0.2
+langgraph>=0.2

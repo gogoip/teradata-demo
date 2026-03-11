@@ -1,0 +1,12 @@
+apiVersion: 1
+
+datasources:
+  - name: Telemetry SQLite
+    uid: telemetry-sqlite
+    type: frser-sqlite-datasource
+    access: proxy
+    isDefault: true
+    editable: true
+    jsonData:
+      path: /opt/telemetry/telemetry.db
+      cacheMode: shared
