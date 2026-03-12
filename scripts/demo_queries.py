@@ -10,9 +10,32 @@ from typing import Any
 
 import pandas as pd
 
+from teradata_utils import DemoConnectionConfig, connect_teradata, workload_filter_sql, workload_label_from_row
 
-def _connect(db_path: str | Path) -> sqlite3.Connection:
-    return sqlite3.connect(str(db_path))
+
+def _config(source: str | Path | dict[str, Any] | DemoConnectionConfig) -> DemoConnectionConfig:
+    if isinstance(source, DemoConnectionConfig):
+        return source
+    if isinstance(source, (str, Path)):
+        return DemoConnectionConfig(backend="sqlite", db_path=str(source))
+    return DemoConnectionConfig(**source)
+
+
+def _connect(source: str | Path | dict[str, Any] | DemoConnectionConfig):
+    config = _config(source)
+    if config.backend == "sqlite":
+        return sqlite3.connect(str(config.db_path))
+    return connect_teradata()
+
+
+def _read_sql(source: str | Path | dict[str, Any] | DemoConnectionConfig, sql: str, params: list[Any] | None = None) -> pd.DataFrame:
+    conn = _connect(source)
+    try:
+        if isinstance(conn, sqlite3.Connection):
+            return pd.read_sql_query(sql, conn, params=params)
+        return pd.read_sql(sql, conn, params=params)
+    finally:
+        conn.close()
 
 
 def _since_dt(range_key: str, custom_hours: int = 24) -> datetime:
@@ -24,29 +47,30 @@ def _since_dt(range_key: str, custom_hours: int = 24) -> datetime:
     return now - timedelta(hours=max(1, custom_hours))
 
 
-def get_kpis(db_path: str | Path, since: datetime) -> pd.DataFrame:
-    with _connect(db_path) as conn:
-        return pd.read_sql_query(
-            """
-            SELECT ts_window_start, ts_window_end, cpu_at_risk, io_at_risk, incidents_predicted, cost_risk_index
-            FROM impact_kpis
-            WHERE ts_window_end >= ?
-            ORDER BY ts_window_end
-            """,
-            conn,
-            params=[since.isoformat(timespec="seconds")],
-        )
+def get_kpis(source: str | Path | dict[str, Any] | DemoConnectionConfig, since: datetime) -> pd.DataFrame:
+    config = _config(source)
+    return _read_sql(
+        config,
+        f"""
+        SELECT ts_window_start, ts_window_end, cpu_at_risk, io_at_risk, incidents_predicted, cost_risk_index
+        FROM {config.td_kpi_table if config.backend == 'teradata' else 'impact_kpis'}
+        WHERE ts_window_end >= ?
+        ORDER BY ts_window_end
+        """,
+        [since.isoformat(timespec="seconds")],
+    )
 
 
 def get_metric_series(
-    db_path: str | Path,
+    source: str | Path | dict[str, Any] | DemoConnectionConfig,
     metric_name: str,
     since: datetime,
     entity_filter: str | None = None,
 ) -> pd.DataFrame:
+    config = _config(source)
     sql = """
-        SELECT ts, entity_id, value
-        FROM metric_timeseries
+        SELECT ts, entity_id, {value_col}
+        FROM {table_name}
         WHERE metric_name = ? AND ts >= ?
     """
     params: list[Any] = [metric_name, since.isoformat(timespec="seconds")]
@@ -54,18 +78,28 @@ def get_metric_series(
         sql += " AND entity_id = ?"
         params.append(entity_filter)
     sql += " ORDER BY ts"
-    with _connect(db_path) as conn:
-        return pd.read_sql_query(sql, conn, params=params)
+    df = _read_sql(
+        config,
+        sql.format(
+            table_name=config.td_metric_table if config.backend == "teradata" else "metric_timeseries",
+            value_col="metric_value" if config.backend == "teradata" else "value",
+        ),
+        params,
+    )
+    if config.backend == "teradata" and not df.empty:
+        df = df.rename(columns={"metric_value": "value"})
+    return df
 
 
 def get_model_state(
-    db_path: str | Path,
+    source: str | Path | dict[str, Any] | DemoConnectionConfig,
     scenario_id: str | None = None,
     entity_type: str | None = None,
 ) -> pd.DataFrame:
+    config = _config(source)
     sql = """
         SELECT scenario_id, entity_type, entity_id, trained_at, baseline_json
-        FROM model_state
+        FROM {table_name}
         WHERE 1 = 1
     """
     params: list[Any] = []
@@ -77,8 +111,7 @@ def get_model_state(
         params.append(entity_type)
     sql += " ORDER BY trained_at DESC"
 
-    with _connect(db_path) as conn:
-        df = pd.read_sql_query(sql, conn, params=params)
+    df = _read_sql(config, sql.format(table_name=config.td_model_state_table if config.backend == "teradata" else "model_state"), params)
 
     if not df.empty:
         df["baseline"] = df["baseline_json"].apply(_safe_json)
@@ -86,14 +119,15 @@ def get_model_state(
 
 
 def get_anomalies(
-    db_path: str | Path,
+    source: str | Path | dict[str, Any] | DemoConnectionConfig,
     since: datetime,
     severity_filter: str | None = None,
     scenario_filter: str | None = None,
 ) -> pd.DataFrame:
+    config = _config(source)
     sql = """
         SELECT event_id, scenario_id, severity, entity_type, entity_id, ts, observed, expected, score, context_json
-        FROM anomaly_events
+        FROM {table_name}
         WHERE ts >= ? AND severity <> 'healthy'
     """
     params: list[Any] = [since.isoformat(timespec="seconds")]
@@ -105,60 +139,64 @@ def get_anomalies(
         params.append(scenario_filter)
     sql += " ORDER BY ts DESC"
 
-    with _connect(db_path) as conn:
-        return pd.read_sql_query(sql, conn, params=params)
+    return _read_sql(config, sql.format(table_name=config.td_anomaly_table if config.backend == "teradata" else "anomaly_events"), params)
 
 
-def get_recent_observed_expected(db_path: str | Path, since: datetime) -> pd.DataFrame:
-    with _connect(db_path) as conn:
-        return pd.read_sql_query(
-            """
-            SELECT scenario_id, entity_id, ts, observed, expected, score
-            FROM anomaly_events
-            WHERE ts >= ? AND severity <> 'healthy' AND observed IS NOT NULL AND expected IS NOT NULL
-            ORDER BY ts DESC
-            """,
-            conn,
-            params=[since.isoformat(timespec="seconds")],
-        )
+def get_recent_observed_expected(source: str | Path | dict[str, Any] | DemoConnectionConfig, since: datetime) -> pd.DataFrame:
+    config = _config(source)
+    return _read_sql(
+        config,
+        f"""
+        SELECT scenario_id, entity_id, ts, observed, expected, score
+        FROM {config.td_anomaly_table if config.backend == 'teradata' else 'anomaly_events'}
+        WHERE ts >= ? AND severity <> 'healthy' AND observed IS NOT NULL AND expected IS NOT NULL
+        ORDER BY ts DESC
+        """,
+        [since.isoformat(timespec="seconds")],
+    )
 
 
-def get_latest_data_timestamp(db_path: str | Path) -> datetime | None:
-    with _connect(db_path) as conn:
-        row = conn.execute(
-            """
-            SELECT MAX(ts) FROM (
-                SELECT MAX(ts) AS ts FROM metric_timeseries
-                UNION ALL
-                SELECT MAX(ts) AS ts FROM anomaly_events
-                UNION ALL
-                SELECT MAX(ts_window_end) AS ts FROM impact_kpis
-            )
-            """
-        ).fetchone()
-    if not row or not row[0]:
+def get_latest_data_timestamp(source: str | Path | dict[str, Any] | DemoConnectionConfig) -> datetime | None:
+    config = _config(source)
+    df = _read_sql(
+        config,
+        f"""
+        SELECT MAX(ts) AS ts FROM (
+            SELECT MAX(ts) AS ts FROM {config.td_metric_table if config.backend == 'teradata' else 'metric_timeseries'}
+            UNION ALL
+            SELECT MAX(ts) AS ts FROM {config.td_anomaly_table if config.backend == 'teradata' else 'anomaly_events'}
+            UNION ALL
+            SELECT MAX(ts_window_end) AS ts FROM {config.td_kpi_table if config.backend == 'teradata' else 'impact_kpis'}
+        ) latest
+        """,
+    )
+    if df.empty or not df.iloc[0, 0]:
         return None
-    return datetime.fromisoformat(str(row[0]).replace("Z", "+00:00")).replace(tzinfo=None)
+    return datetime.fromisoformat(str(df.iloc[0, 0]).replace("Z", "+00:00")).replace(tzinfo=None)
 
 
-def list_entities_for_metric(db_path: str | Path, metric_name: str) -> list[str]:
-    with _connect(db_path) as conn:
-        rows = conn.execute(
-            "SELECT DISTINCT entity_id FROM metric_timeseries WHERE metric_name = ? ORDER BY entity_id",
-            (metric_name,),
-        ).fetchall()
-    return [r[0] for r in rows]
+def list_entities_for_metric(source: str | Path | dict[str, Any] | DemoConnectionConfig, metric_name: str) -> list[str]:
+    config = _config(source)
+    df = _read_sql(
+        config,
+        f"SELECT DISTINCT entity_id FROM {config.td_metric_table if config.backend == 'teradata' else 'metric_timeseries'} WHERE metric_name = ? ORDER BY entity_id",
+        [metric_name],
+    )
+    if df.empty:
+        return []
+    return df["entity_id"].astype(str).tolist()
 
 
 def get_io_series(
-    db_path: str | Path,
+    source: str | Path | dict[str, Any] | DemoConnectionConfig,
     since: datetime,
     workload: str = "all",
     check_mode: str = "sum",
 ) -> pd.DataFrame:
+    config = _config(source)
     sql = """
-        SELECT ts, entity_id, value
-        FROM metric_timeseries
+        SELECT ts, entity_id, {value_col}
+        FROM {table_name}
         WHERE metric_name = 'workload_io_count' AND ts >= ?
     """
     params: list[Any] = [since.isoformat(timespec="seconds")]
@@ -167,8 +205,16 @@ def get_io_series(
         params.append(workload)
     sql += " ORDER BY ts"
 
-    with _connect(db_path) as conn:
-        df = pd.read_sql_query(sql, conn, params=params)
+    df = _read_sql(
+        config,
+        sql.format(
+            table_name=config.td_metric_table if config.backend == "teradata" else "metric_timeseries",
+            value_col="metric_value" if config.backend == "teradata" else "value",
+        ),
+        params,
+    )
+    if config.backend == "teradata" and not df.empty:
+        df = df.rename(columns={"metric_value": "value"})
 
     if df.empty:
         return df
@@ -179,10 +225,11 @@ def get_io_series(
     return out
 
 
-def get_io_outlier_events(db_path: str | Path, since: datetime, workload: str = "all") -> pd.DataFrame:
+def get_io_outlier_events(source: str | Path | dict[str, Any] | DemoConnectionConfig, since: datetime, workload: str = "all") -> pd.DataFrame:
+    config = _config(source)
     sql = """
         SELECT event_id, scenario_id, severity, entity_type, entity_id, ts, observed, expected, score, context_json
-        FROM anomaly_events
+        FROM {table_name}
         WHERE scenario_id = 'S2' AND severity <> 'healthy' AND ts >= ?
     """
     params: list[Any] = [since.isoformat(timespec="seconds")]
@@ -191,12 +238,11 @@ def get_io_outlier_events(db_path: str | Path, since: datetime, workload: str = 
         params.append(workload)
     sql += " ORDER BY ts"
 
-    with _connect(db_path) as conn:
-        return pd.read_sql_query(sql, conn, params=params)
+    return _read_sql(config, sql.format(table_name=config.td_anomaly_table if config.backend == "teradata" else "anomaly_events"), params)
 
 
 def get_tcore_workload_attribution(
-    db_path: str | Path,
+    db_path: str | Path | dict[str, Any] | DemoConnectionConfig,
     since: datetime,
     remediation: str = "none",
     workload_scope: str = "all",
@@ -247,7 +293,7 @@ def get_tcore_workload_attribution(
 
 
 def get_tcore_summary(
-    db_path: str | Path,
+    db_path: str | Path | dict[str, Any] | DemoConnectionConfig,
     since: datetime,
     remediation: str = "none",
     workload_scope: str = "all",
@@ -281,7 +327,7 @@ def get_tcore_summary(
 
 
 def get_top_tcore_offenders(
-    db_path: str | Path,
+    db_path: str | Path | dict[str, Any] | DemoConnectionConfig,
     since: datetime,
     remediation: str = "none",
     workload_scope: str = "all",
@@ -308,7 +354,7 @@ def get_top_tcore_offenders(
 
 
 def get_top_consumers(
-    db_path: str | Path,
+    db_path: str | Path | dict[str, Any] | DemoConnectionConfig,
     since: datetime,
     limit: int = 10,
 ) -> pd.DataFrame:
@@ -327,24 +373,65 @@ def get_top_consumers(
 
 
 def get_top_skew_drivers(
-    db_path: str | Path,
+    db_path: str | Path | dict[str, Any] | DemoConnectionConfig,
     since: datetime,
     limit: int = 10,
 ) -> pd.DataFrame:
+    config = _config(db_path)
+    if config.backend == "teradata":
+        filter_sql = workload_filter_sql(config)
+        sql = f"""
+            SELECT TOP {int(limit)}
+                CAST(s.QueryID AS VARCHAR(64)) || '|step:' || TRIM(CAST(s.StepLev1Num AS VARCHAR(32))) AS query_step,
+                CAST(s.QueryID AS VARCHAR(64)) AS query_id,
+                CAST(s.StepLev1Num AS VARCHAR(32)) AS step_id,
+                MAX(
+                    CASE
+                        WHEN COALESCE(s.NumOfActiveAMPs, 0) > 0 AND COALESCE(s.CPUTime, 0) > 0
+                        THEN CAST(s.MaxAmpCPUTime AS FLOAT) / NULLIF(CAST(s.CPUTime AS FLOAT) / CAST(s.NumOfActiveAMPs AS FLOAT), 0)
+                        ELSE 0
+                    END
+                ) AS latest_skew,
+                SUM(
+                    CASE
+                        WHEN COALESCE(s.NumOfActiveAMPs, 0) > 0 AND COALESCE(s.CPUTime, 0) > 0
+                        THEN
+                            CASE
+                                WHEN (CAST(s.MaxAmpCPUTime AS FLOAT) / NULLIF(CAST(s.CPUTime AS FLOAT) / CAST(s.NumOfActiveAMPs AS FLOAT), 0)) > 5
+                                THEN (CAST(s.MaxAmpCPUTime AS FLOAT) / NULLIF(CAST(s.CPUTime AS FLOAT) / CAST(s.NumOfActiveAMPs AS FLOAT), 0)) - 5
+                                ELSE 0
+                            END
+                        ELSE 0
+                    END
+                ) AS skew_pressure
+            FROM {config.td_dbql_step_table} s
+            JOIN {config.td_dbql_query_table} q ON q.QueryID = s.QueryID
+            WHERE q.StartTime >= ?
+            {filter_sql}
+            GROUP BY 1, 2, 3
+            ORDER BY skew_pressure DESC, latest_skew DESC
+        """
+        return _read_sql(config, sql, [since.isoformat(timespec="seconds")])
+
     s = get_metric_series(db_path, "skew_ratio", since)
     if s.empty:
         return s
     s["skew_pressure"] = (s["value"] - 5.0).clip(lower=0.0)
-    return (
+    out = (
         s.groupby("entity_id", as_index=False)
         .agg(latest_skew=("value", "last"), skew_pressure=("skew_pressure", "sum"))
         .sort_values(["skew_pressure", "latest_skew"], ascending=False)
         .head(limit)
     )
+    if not out.empty:
+        extracted = out["entity_id"].str.extract(r"query:(?P<query_id>[^|]+)\|step:(?P<step_id>.+)")
+        out["query_id"] = extracted["query_id"]
+        out["step_id"] = extracted["step_id"]
+    return out
 
 
 def get_peak_pressure_series(
-    db_path: str | Path,
+    db_path: str | Path | dict[str, Any] | DemoConnectionConfig,
     since: datetime,
     remediation: str = "none",
     workload_scope: str = "all",
@@ -364,14 +451,14 @@ def get_peak_pressure_series(
 
 
 def get_recent_query_offenders(
-    db_path: str | Path,
+    source: str | Path | dict[str, Any] | DemoConnectionConfig,
     since: datetime,
     workload: str = "all",
     limit: int = 20,
 ) -> pd.DataFrame:
     start = since
     end = datetime.utcnow()
-    queries = get_raw_workload_join_samples(db_path, start, end, workload=workload, row_limit=max(limit * 5, 50))
+    queries = get_raw_workload_join_samples(source, start, end, workload=workload, row_limit=max(limit * 5, 50))
     if queries.empty:
         return queries
     queries["risk_score"] = (queries["amp_cpu_time"] * 0.01) + (queries["io_count"] * 0.001)
@@ -485,12 +572,43 @@ def build_io_bands(series: pd.DataFrame, window: int = 24) -> pd.DataFrame:
 
 
 def get_raw_dbqlog_samples(
-    db_path: str | Path,
+    source: str | Path | dict[str, Any] | DemoConnectionConfig,
     start: datetime,
     end: datetime,
     workload: str = "all",
     row_limit: int = 100,
 ) -> pd.DataFrame:
+    config = _config(source)
+    if config.backend == "teradata":
+        workload_sql = workload_filter_sql(config)
+        sql = f"""
+            SELECT TOP {int(row_limit)}
+                q.QueryID AS query_id,
+                q.UserName AS user_name,
+                q.StartTime AS start_time,
+                q.FirstRespTime AS end_time,
+                CAST(q.TotalFirstRespTime AS FLOAT) AS elapsed_time,
+                CAST(q.AMPCPUTime AS FLOAT) AS amp_cpu_time,
+                CAST(q.TotalIOCount AS BIGINT) AS io_count,
+                q.ErrorCode AS error_code,
+                q.QueryBand AS query_band,
+                q.DefaultDatabase AS default_database,
+                q.StatementType AS statement_type,
+                q.QueryText AS sql_text
+            FROM {config.td_dbql_query_table} q
+            WHERE q.StartTime >= ? AND q.StartTime <= ?
+            {workload_sql}
+            ORDER BY q.StartTime DESC
+        """
+        df = _read_sql(config, sql, [start.isoformat(timespec="seconds"), end.isoformat(timespec="seconds")])
+        if not df.empty:
+            df["workload_name"] = df.apply(
+                lambda row: workload_label_from_row(row, demo_schema=config.td_demo_schema, demo_user=config.td_demo_user),
+                axis=1,
+            )
+            if workload != "all":
+                df = df[df["workload_name"] == workload]
+        return df
     sql = """
         SELECT
             q.query_id,
@@ -512,37 +630,69 @@ def get_raw_dbqlog_samples(
         params.append(workload)
     sql += " ORDER BY q.start_time DESC LIMIT ?"
     params.append(int(row_limit))
-    with _connect(db_path) as conn:
-        return pd.read_sql_query(sql, conn, params=params)
+    return _read_sql(config, sql, params)
 
 
 def get_raw_resusage_samples(
-    db_path: str | Path,
+    source: str | Path | dict[str, Any] | DemoConnectionConfig,
     start: datetime,
     end: datetime,
     row_limit: int = 100,
 ) -> pd.DataFrame:
-    with _connect(db_path) as conn:
-        return pd.read_sql_query(
-            """
-            SELECT sample_time, node_id, cpu_percent, disk_io
-            FROM resusage_spma
-            WHERE sample_time >= ? AND sample_time <= ?
-            ORDER BY sample_time DESC
-            LIMIT ?
-            """,
-            conn,
-            params=[start.isoformat(timespec="seconds"), end.isoformat(timespec="seconds"), int(row_limit)],
+    config = _config(source)
+    if config.backend == "teradata":
+        sample_ts_expr = (
+            "CAST(TheDate AS TIMESTAMP(0)) "
+            "+ CAST((TheTime / 10000) AS INTEGER) * INTERVAL '1' HOUR "
+            "+ CAST((MOD(TheTime, 10000) / 100) AS INTEGER) * INTERVAL '1' MINUTE "
+            "+ CAST(MOD(TheTime, 100) AS INTEGER) * INTERVAL '1' SECOND"
         )
+        return _read_sql(
+            config,
+            f"""
+            SELECT TOP {int(row_limit)}
+                CAST(({sample_ts_expr}) AS TIMESTAMP(0)) AS sample_time,
+                NodeID AS node_id,
+                CAST(CPUUServ AS FLOAT) AS cpu_percent,
+                CAST(COALESCE(NosPhysReadIOs, UsedIota, PM_COD_IO, 0) AS FLOAT) AS disk_io
+            FROM {config.td_resusage_table}
+            WHERE CAST(({sample_ts_expr}) AS TIMESTAMP(0)) >= ?
+              AND CAST(({sample_ts_expr}) AS TIMESTAMP(0)) <= ?
+            ORDER BY sample_time DESC
+            """,
+            [start.isoformat(timespec="seconds"), end.isoformat(timespec="seconds")],
+        )
+    return _read_sql(
+        config,
+        """
+        SELECT sample_time, node_id, cpu_percent, disk_io
+        FROM resusage_spma
+        WHERE sample_time >= ? AND sample_time <= ?
+        ORDER BY sample_time DESC
+        LIMIT ?
+        """,
+        [start.isoformat(timespec="seconds"), end.isoformat(timespec="seconds"), int(row_limit)],
+    )
 
 
 def get_raw_workload_join_samples(
-    db_path: str | Path,
+    source: str | Path | dict[str, Any] | DemoConnectionConfig,
     start: datetime,
     end: datetime,
     workload: str = "all",
     row_limit: int = 100,
 ) -> pd.DataFrame:
+    config = _config(source)
+    if config.backend == "teradata":
+        df = get_raw_dbqlog_samples(config, start, end, workload=workload, row_limit=row_limit)
+        if df.empty:
+            return df
+        df = df[["query_id", "workload_name", "start_time", "elapsed_time", "amp_cpu_time", "io_count"]].copy()
+        df["io_per_cpu"] = df.apply(
+            lambda row: round(float(row["io_count"]) / float(row["amp_cpu_time"]), 4) if float(row["amp_cpu_time"]) > 0 else None,
+            axis=1,
+        )
+        return df
     sql = """
         SELECT
             q.query_id,
@@ -565,8 +715,7 @@ def get_raw_workload_join_samples(
         params.append(workload)
     sql += " ORDER BY q.start_time DESC LIMIT ?"
     params.append(int(row_limit))
-    with _connect(db_path) as conn:
-        return pd.read_sql_query(sql, conn, params=params)
+    return _read_sql(config, sql, params)
 
 
 def get_band_snapshot(series_with_bands: pd.DataFrame, selected_ts: datetime) -> dict[str, Any] | None:

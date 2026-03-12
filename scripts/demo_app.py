@@ -15,6 +15,7 @@ import streamlit as st
 try:
     from analysis_agent import build_agent_context, groq_ready, run_agent
     from demo_queries import (
+        DemoConnectionConfig,
         _since_dt,
         build_io_bands,
         get_band_snapshot,
@@ -36,6 +37,7 @@ try:
 except ModuleNotFoundError:
     from scripts.analysis_agent import build_agent_context, groq_ready, run_agent
     from scripts.demo_queries import (
+        DemoConnectionConfig,
         _since_dt,
         build_io_bands,
         get_band_snapshot,
@@ -316,8 +318,9 @@ def _render_tcore_dashboard(
     t1, t2 = st.columns([3, 2])
     with t1:
         st.markdown("#### Top Workload Offenders")
+        offender_view = offenders.rename(columns={"entity_id": "workload"})
         st.dataframe(
-            offenders[["entity_id", "excess_tcore", "adjusted_excess_tcore", "cpu_excess", "io_excess", "reduction_pct"]],
+            offender_view[["workload", "excess_tcore", "adjusted_excess_tcore", "cpu_excess", "io_excess", "reduction_pct"]],
             use_container_width=True,
             hide_index=True,
         )
@@ -333,7 +336,7 @@ def _render_tcore_dashboard(
         st.markdown("#### Top Consumers")
         st.dataframe(consumers, use_container_width=True, hide_index=True)
         st.markdown("#### Top Skew Drivers")
-        st.dataframe(skew_drivers, use_container_width=True, hide_index=True)
+        st.dataframe(skew_drivers.rename(columns={"entity_id": "query_step"}), use_container_width=True, hide_index=True)
 
 
 def _render_agent_panel(
@@ -351,6 +354,8 @@ def _render_agent_panel(
     actions: list[dict[str, str]],
     remediation: str,
     comparison_mode: str,
+    telemetry_backend: str,
+    telemetry_scope: dict[str, str],
 ) -> None:
     st.markdown("### Analysis Agent")
 
@@ -384,6 +389,8 @@ def _render_agent_panel(
         remediation=remediation,
         comparison_mode=comparison_mode,
         actions=actions,
+        telemetry_backend=telemetry_backend,
+        telemetry_scope=telemetry_scope,
     )
 
     if latest_outlier is None:
@@ -476,11 +483,15 @@ def main() -> None:
 
     st.sidebar.header("Data Source")
     default_db = str(Path("data") / "telemetry.db")
-    db_path = st.sidebar.text_input("SQLite DB path", value=default_db)
+    backend = st.sidebar.selectbox("Backend", ["sqlite", "teradata"], index=0)
+    db_path = st.sidebar.text_input("SQLite DB path", value=default_db, disabled=(backend != "sqlite"))
+    td_demo_schema = st.sidebar.text_input("Demo schema filter", value=os.getenv("TD_DEMO_SCHEMA", ""), disabled=(backend != "teradata"))
+    td_demo_user = st.sidebar.text_input("Demo user filter", value=os.getenv("TD_DEMO_USER", ""), disabled=(backend != "teradata"))
     groq_key = st.sidebar.text_input("Groq API key", value=os.getenv("GROQ_API_KEY", ""), type="password")
     if groq_key:
         os.environ["GROQ_API_KEY"] = groq_key
     auto_refresh = st.sidebar.checkbox("Auto refresh every 15s", value=True)
+    data_source = DemoConnectionConfig(backend=backend, db_path=db_path, td_demo_schema=td_demo_schema, td_demo_user=td_demo_user)
 
     st.sidebar.header("Time Range")
     range_key = st.sidebar.selectbox(
@@ -492,9 +503,9 @@ def main() -> None:
     custom_hours = st.sidebar.number_input("Custom hours", min_value=1, max_value=720, value=24, step=1)
     since = _since_dt(range_key, custom_hours=int(custom_hours))
 
-    latest_ts = get_latest_data_timestamp(db_path)
+    latest_ts = get_latest_data_timestamp(data_source)
     if latest_ts is None:
-        st.warning("No telemetry/scenario data found. Run telemetry generation and scenario engine first.")
+        st.warning("No telemetry/scenario data found. Run workload generation and scenario processing first.")
     else:
         st.caption(f"Latest data timestamp: `{latest_ts.isoformat(timespec='seconds')}` UTC")
         age_minutes = (datetime.utcnow() - latest_ts).total_seconds() / 60.0
@@ -505,7 +516,7 @@ def main() -> None:
     with ctrl1:
         _ = st.selectbox("Dataset", ["Full"], index=0)
     with ctrl2:
-        workloads = ["all"] + list_entities_for_metric(db_path, "workload_io_count")
+        workloads = ["all"] + list_entities_for_metric(data_source, "workload_io_count")
         workload = st.selectbox("S2 Workload", workloads, index=0)
     with ctrl3:
         comparison_mode = st.selectbox("Comparison", ["Before", "After", "Delta"], index=0)
@@ -516,18 +527,18 @@ def main() -> None:
     with ctrl6:
         show_trend = st.checkbox("Trend", value=True)
 
-    io_series = get_io_series(db_path, since=since, workload=workload, check_mode="sum")
+    io_series = get_io_series(data_source, since=since, workload=workload, check_mode="sum")
     if io_series.empty:
         st.info("No IO data in the selected range/workload.")
         return
 
-    baseline_summary = get_tcore_summary(db_path, since, remediation="none", workload_scope=workload_scope)
-    scenario_summary = get_tcore_summary(db_path, since, remediation=remediation, workload_scope=workload_scope)
-    offenders = get_top_tcore_offenders(db_path, since, remediation=remediation, workload_scope=workload_scope, limit=8)
-    consumers = get_top_consumers(db_path, since, limit=8)
-    skew_drivers = get_top_skew_drivers(db_path, since, limit=8)
-    peak_pressure = get_peak_pressure_series(db_path, since, remediation=remediation, workload_scope=workload_scope)
-    query_offenders = get_recent_query_offenders(db_path, since, workload=workload_scope, limit=12)
+    baseline_summary = get_tcore_summary(data_source, since, remediation="none", workload_scope=workload_scope)
+    scenario_summary = get_tcore_summary(data_source, since, remediation=remediation, workload_scope=workload_scope)
+    offenders = get_top_tcore_offenders(data_source, since, remediation=remediation, workload_scope=workload_scope, limit=8)
+    consumers = get_top_consumers(data_source, since, limit=8)
+    skew_drivers = get_top_skew_drivers(data_source, since, limit=8)
+    peak_pressure = get_peak_pressure_series(data_source, since, remediation=remediation, workload_scope=workload_scope)
+    query_offenders = get_recent_query_offenders(data_source, since, workload=workload_scope, limit=12)
     actions = get_remediation_actions(offenders, consumers, skew_drivers)
 
     _render_tcore_dashboard(
@@ -543,7 +554,7 @@ def main() -> None:
     )
 
     banded = build_io_bands(io_series, window=24)
-    outliers = get_io_outlier_events(db_path, since=since, workload=workload)
+    outliers = get_io_outlier_events(data_source, since=since, workload=workload)
     fig = _build_io_figure(banded, outliers, show_trend=show_trend)
 
     if "selected_point" not in st.session_state:
@@ -589,7 +600,7 @@ def main() -> None:
         st.success("No S2 outliers in selected window.")
     else:
         st.dataframe(
-            outliers[["event_id", "ts", "entity_id", "severity", "observed", "expected", "score"]],
+            outliers.rename(columns={"entity_id": "workload"})[["event_id", "ts", "workload", "severity", "observed", "expected", "score"]],
             use_container_width=True,
             hide_index=True,
         )
@@ -608,6 +619,8 @@ def main() -> None:
         actions=actions,
         remediation=remediation,
         comparison_mode=comparison_mode,
+        telemetry_backend=backend,
+        telemetry_scope={"demo_schema": td_demo_schema, "demo_user": td_demo_user},
     )
 
     _render_band_debug(banded, selected_snapshot)
@@ -628,22 +641,22 @@ def main() -> None:
             st.info("No point selected yet. Using selected range for raw tables.")
             raw_start, raw_end = since, datetime.utcnow()
 
-        dbq = get_raw_dbqlog_samples(db_path, raw_start, raw_end, workload=workload, row_limit=int(row_limit))
-        res = get_raw_resusage_samples(db_path, raw_start, raw_end, row_limit=int(row_limit))
-        join = get_raw_workload_join_samples(db_path, raw_start, raw_end, workload=workload, row_limit=int(row_limit))
+        dbq = get_raw_dbqlog_samples(data_source, raw_start, raw_end, workload=workload, row_limit=int(row_limit))
+        res = get_raw_resusage_samples(data_source, raw_start, raw_end, row_limit=int(row_limit))
+        join = get_raw_workload_join_samples(data_source, raw_start, raw_end, workload=workload, row_limit=int(row_limit))
 
         st.caption(
-            "SQL used: SELECT query_id,user_name,start_time,end_time,elapsed_time,amp_cpu_time,io_count,error_code,"
-            "workload_name FROM dbc_dbqlogtbl LEFT JOIN workload_map ... WHERE start_time BETWEEN start/end"
+            "DBQL drilldown using raw telemetry identifiers. "
+            f"Backend={backend}; filters: schema={td_demo_schema or 'n/a'}, user={td_demo_user or 'n/a'}"
         )
         st.dataframe(dbq, use_container_width=True, hide_index=True)
 
-        st.caption("SQL used: SELECT sample_time,node_id,cpu_percent,disk_io FROM resusage_spma WHERE sample_time BETWEEN start/end")
+        st.caption("ResUsage drilldown using node/sample telemetry from the selected time window.")
         st.dataframe(res, use_container_width=True, hide_index=True)
 
         st.caption(
-            "SQL used: SELECT query_id,workload_name,start_time,elapsed_time,amp_cpu_time,io_count,io_per_cpu "
-            "FROM dbc_dbqlogtbl LEFT JOIN workload_map ... WHERE start_time BETWEEN start/end"
+            "Derived workload view from raw DBQL telemetry. "
+            "Workload labels are inferred from demo user/schema and query metadata."
         )
         st.dataframe(join, use_container_width=True, hide_index=True)
 

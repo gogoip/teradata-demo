@@ -13,7 +13,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from generate_telemetry import TABLES, USERS, init_db, weighted_workload
-from scenario_engine import SQLiteSource, ScenarioEngine
+from scenario_engine import SQLiteScenarioStore, SQLiteSource, ScenarioEngine
 
 
 def utc_minute_now() -> datetime:
@@ -261,7 +261,7 @@ def main() -> None:
 
     with sqlite3.connect(db_path) as conn:
         producer = LiveTelemetryProducer(conn, args)
-        engine = ScenarioEngine(conn, SQLiteSource(conn), args.window_min, args.lookback_days)
+        engine = ScenarioEngine(conn, SQLiteSource(conn), SQLiteScenarioStore(conn), args.window_min, args.lookback_days)
         engine.initialize_schema([Path(args.schema), Path(args.scenario_schema)])
 
         iteration = 0
