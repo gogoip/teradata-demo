@@ -11,7 +11,7 @@ SCRIPTS_DIR = REPO_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from demo_queries import get_tcore_summary, get_tcore_workload_attribution  # noqa: E402
-from scenario_engine import SQLiteSource, ScenarioEngine, floor_window  # noqa: E402
+from scenario_engine import SQLiteScenarioStore, SQLiteSource, ScenarioEngine, floor_window  # noqa: E402
 
 
 class DemoQueriesTests(unittest.TestCase):
@@ -80,7 +80,7 @@ class DemoQueriesTests(unittest.TestCase):
                     (ts.isoformat(timespec="seconds"), 45 + (i % 10), 1200 + (i % 20) * 50),
                 )
 
-            engine = ScenarioEngine(conn, SQLiteSource(conn), window_min=15, lookback_days=30)
+            engine = ScenarioEngine(conn, SQLiteSource(conn), SQLiteScenarioStore(conn), window_min=15, lookback_days=30)
             run_at = floor_window(base + timedelta(minutes=15 * ((4 * 24 * 4) - 1)), 15) + timedelta(minutes=15)
             engine.run_once(run_at)
             conn.commit()

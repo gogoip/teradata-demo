@@ -192,3 +192,83 @@ GROUP BY query_id, step_id
 HAVING skew_ratio > 5
 ORDER BY skew_ratio DESC;
 ```
+
+## Live Vantage connectivity
+
+Use environment variables or notebook secrets. Do not hardcode credentials into repo files.
+
+PowerShell:
+
+```powershell
+$env:TD_HOST="demo-env-vvy0mcddq6sdnb38.env.clearscape.teradata.com"
+$env:TD_USERNAME="<your-username>"
+$env:TD_PASSWORD="<your-password>"
+```
+
+Run a read-only smoke test plus telemetry discovery:
+
+```bash
+python scripts/vantage_connectivity_check.py --output pretty
+```
+
+If the environment exposes different object names, override them when running the scenario engine:
+
+```bash
+python scripts/scenario_engine.py --source teradata --db data/telemetry.db --td-dbql-query-table DBC.DBQLogTblV --td-dbql-step-table DBC.DBQLStepTbl --td-resusage-table DBC.ResUsageSpma run
+```
+
+Notes:
+- The scenario engine can write scenario outputs either to the local SQLite file passed by `--db` or to Vantage via `--sink teradata`.
+- The Teradata source reads live telemetry from Vantage using `TD_HOST`, `TD_USERNAME`, and `TD_PASSWORD`.
+- Rotate any credentials that were pasted into chat or shared outside your secret store.
+
+## Run against a real Teradata database
+
+Set environment variables first:
+
+```powershell
+$env:TD_HOST="demo-env-vvy0mcddq6sdnb38.env.clearscape.teradata.com"
+$env:TD_USERNAME="<your-username>"
+$env:TD_PASSWORD="<your-password>"
+$env:TD_DEMO_SCHEMA="td_demo_workload"
+$env:TD_DEMO_USER="<demo-user>"
+```
+
+### 1. Create and run demo workloads in Vantage
+
+```bash
+python scripts/run_vantage_workloads.py --schema td_demo_workload --loops 3 --sleep-seconds 2
+```
+
+This creates a dedicated demo schema and submits repeatable `etl`, `bi`, and `ad_hoc` workload patterns so DBQL captures live telemetry.
+
+### 2. Validate telemetry access
+
+```bash
+python scripts/vantage_connectivity_check.py --output pretty
+```
+
+### 3. Run scenario processing with Vantage as both source and sink
+
+```bash
+python scripts/scenario_engine.py --source teradata --sink teradata --db data/telemetry.db run
+```
+
+Optional overrides:
+
+```bash
+python scripts/scenario_engine.py --source teradata --sink teradata --td-dbql-query-table DBC.DBQLogTblV --td-dbql-step-table DBC.DBQLStepTbl --td-resusage-table DBC.ResUsageSpma --td-metric-table metric_timeseries --td-model-state-table model_state --td-anomaly-table anomaly_events --td-kpi-table impact_kpis run
+```
+
+### 4. Launch the app in Vantage mode
+
+```bash
+streamlit run scripts/demo_app.py
+```
+
+In the sidebar:
+- set `Backend` to `teradata`
+- set `Demo schema filter` and `Demo user filter`
+- optionally set `GROQ_API_KEY`
+
+The app will read scenario outputs plus raw DBQL/ResUsage drilldowns from Vantage and surface raw telemetry IDs such as `QueryID` and `query:...|step:...`.

@@ -9,3 +9,4 @@ streamlit-plotly-events>=0.0.6
 langchain-core>=0.3
 langchain-groq>=0.2
 langgraph>=0.2
+teradatasql>=20.0

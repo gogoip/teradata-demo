@@ -10,7 +10,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = REPO_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from scenario_engine import SQLiteSource, ScenarioEngine, floor_window  # noqa: E402
+from scenario_engine import SQLiteScenarioStore, SQLiteSource, ScenarioEngine, floor_window  # noqa: E402
 
 
 class ScenarioEngineTests(unittest.TestCase):
@@ -28,7 +28,7 @@ class ScenarioEngineTests(unittest.TestCase):
                 pass
 
     def _build_engine(self, conn: sqlite3.Connection) -> ScenarioEngine:
-        engine = ScenarioEngine(conn, SQLiteSource(conn), window_min=15, lookback_days=30)
+        engine = ScenarioEngine(conn, SQLiteSource(conn), SQLiteScenarioStore(conn), window_min=15, lookback_days=30)
         engine.initialize_schema(
             [
                 REPO_ROOT / "schema" / "minimal_telemetry.sql",

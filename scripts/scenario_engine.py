@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -17,6 +18,8 @@ import pandas as pd
 import ruptures as rpt
 from sklearn.ensemble import IsolationForest
 from statsmodels.tsa.seasonal import STL
+
+from teradata_utils import connect_teradata, workload_label_from_row, workload_filter_sql
 
 
 def parse_iso_datetime(raw: str) -> datetime:
@@ -140,40 +143,507 @@ class SQLiteSource(TelemetrySource):
 
 
 class TeradataSource(TelemetrySource):
-    """Stub for future Teradata-native extraction."""
-
-    def query_logs(self, start: datetime, end: datetime) -> pd.DataFrame:
-        raise NotImplementedError("TeradataSource is not implemented yet.")
-
-    def resusage(self, start: datetime, end: datetime) -> pd.DataFrame:
-        raise NotImplementedError("TeradataSource is not implemented yet.")
-
-    def step_stats(self, start: datetime, end: datetime) -> pd.DataFrame:
-        raise NotImplementedError("TeradataSource is not implemented yet.")
-
-    def table_stats(self) -> pd.DataFrame:
-        raise NotImplementedError("TeradataSource is not implemented yet.")
-
-
-class ScenarioEngine:
     def __init__(
         self,
-        conn: sqlite3.Connection,
-        source: TelemetrySource,
-        window_min: int,
-        lookback_days: int,
+        conn: Any,
+        *,
+        dbql_query_table: str | None = None,
+        dbql_step_table: str | None = None,
+        resusage_table: str | None = None,
+        table_stats_table: str | None = None,
     ):
         self.conn = conn
-        self.source = source
-        self.window_min = window_min
-        self.lookback_days = lookback_days
-        self.period_day = int((24 * 60) / self.window_min)
+        self.dbql_query_table = dbql_query_table or os.getenv("TD_DBQL_QUERY_TABLE", "DBC.DBQLogTbl")
+        self.dbql_step_table = dbql_step_table or os.getenv("TD_DBQL_STEP_TABLE", "DBC.DBQLStepTbl")
+        self.resusage_table = resusage_table or os.getenv("TD_RESUSAGE_TABLE", "DBC.ResUsageSpma")
+        self.table_stats_table = table_stats_table or os.getenv("TD_TABLES_TABLE", "DBC.TablesV")
+        self.demo_schema = os.getenv("TD_DEMO_SCHEMA", "")
+        self.demo_user = os.getenv("TD_DEMO_USER", "")
+
+    def query_logs(self, start: datetime, end: datetime) -> pd.DataFrame:
+        filter_sql = workload_filter_sql(
+            type("Cfg", (), {"demo_user_upper": self.demo_user.upper().strip(), "demo_schema_upper": self.demo_schema.upper().strip()})(),
+        )
+        sql = f"""
+            SELECT
+                q.QueryID AS query_id,
+                q.UserName AS user_name,
+                q.StartTime AS start_time,
+                q.FirstRespTime AS end_time,
+                CAST(q.TotalFirstRespTime AS DOUBLE PRECISION) AS elapsed_time,
+                CAST(q.AMPCPUTime AS DOUBLE PRECISION) AS amp_cpu_time,
+                CAST(q.TotalIOCount AS BIGINT) AS io_count,
+                q.ErrorCode AS error_code,
+                q.QueryBand AS query_band,
+                q.DefaultDatabase AS default_database,
+                q.StatementType AS statement_type,
+                q.QueryText AS sql_text,
+                COALESCE(q.QueryBand, q.WDName, 'Unknown') AS workload_name
+            FROM {self.dbql_query_table} q
+            WHERE q.StartTime >= ? AND q.StartTime < ?
+            {filter_sql}
+        """
+        df = pd.read_sql(sql, self.conn, params=[start, end])
+        if not df.empty:
+            df["workload_name"] = df.apply(
+                lambda row: workload_label_from_row(row, demo_schema=self.demo_schema, demo_user=self.demo_user),
+                axis=1,
+            )
+        return df
+
+    def resusage(self, start: datetime, end: datetime) -> pd.DataFrame:
+        sample_ts_expr = (
+            "CAST(TheDate AS TIMESTAMP(0)) "
+            "+ CAST((TheTime / 10000) AS INTEGER) * INTERVAL '1' HOUR "
+            "+ CAST((MOD(TheTime, 10000) / 100) AS INTEGER) * INTERVAL '1' MINUTE "
+            "+ CAST(MOD(TheTime, 100) AS INTEGER) * INTERVAL '1' SECOND"
+        )
+        sql = f"""
+            SELECT
+                TheTime AS sample_time,
+                NodeID AS node_id,
+                CAST(CPUUServ AS DOUBLE PRECISION) AS cpu_percent,
+                CAST(COALESCE(NosPhysReadIOs, UsedIota, PM_COD_IO, 0) AS DOUBLE PRECISION) AS disk_io,
+                CAST(({sample_ts_expr}) AS TIMESTAMP(0)) AS sample_ts
+            FROM {self.resusage_table}
+            WHERE CAST(({sample_ts_expr}) AS TIMESTAMP(0)) >= ?
+              AND CAST(({sample_ts_expr}) AS TIMESTAMP(0)) < ?
+        """
+        df = pd.read_sql(sql, self.conn, params=[start, end])
+        if not df.empty:
+            df["sample_time"] = df["sample_ts"]
+            df = df.drop(columns=["sample_ts"])
+        return df
+
+    def step_stats(self, start: datetime, end: datetime) -> pd.DataFrame:
+        filter_sql = workload_filter_sql(
+            type("Cfg", (), {"demo_user_upper": self.demo_user.upper().strip(), "demo_schema_upper": self.demo_schema.upper().strip()})(),
+        )
+        sql = f"""
+            SELECT
+                s.QueryID AS query_id,
+                s.StepLev1Num AS step_id,
+                s.MaxCPUAmpNumber AS amp_id,
+                CAST(s.CPUTime AS DOUBLE PRECISION) AS total_cpu_time,
+                CAST(s.MaxAmpCPUTime AS DOUBLE PRECISION) AS max_amp_cpu_time,
+                CAST(s.NumOfActiveAMPs AS INTEGER) AS num_active_amps,
+                q.StartTime AS start_time,
+                q.UserName AS user_name,
+                q.DefaultDatabase AS default_database,
+                q.QueryBand AS query_band,
+                q.QueryText AS sql_text
+            FROM {self.dbql_step_table} s
+            JOIN {self.dbql_query_table} q
+              ON q.QueryID = s.QueryID
+            WHERE q.StartTime >= ? AND q.StartTime < ?
+            {filter_sql}
+        """
+        df = pd.read_sql(sql, self.conn, params=[start, end])
+        if df.empty:
+            return df
+
+        expanded_rows: list[dict[str, Any]] = []
+        for row in df.to_dict("records"):
+            query_id = row["query_id"]
+            step_id = row["step_id"]
+            amp_id = row.get("amp_id") or 0
+            total_cpu_time = float(row.get("total_cpu_time") or 0.0)
+            max_amp_cpu_time = float(row.get("max_amp_cpu_time") or 0.0)
+            num_active_amps = int(row.get("num_active_amps") or 0)
+            start_time = row["start_time"]
+            if num_active_amps <= 1 or total_cpu_time <= 0 or max_amp_cpu_time <= 0:
+                expanded_rows.append(
+                    {
+                        "query_id": query_id,
+                        "step_id": step_id,
+                        "amp_id": amp_id,
+                        "cpu_time": max(max_amp_cpu_time, total_cpu_time),
+                        "start_time": start_time,
+                    }
+                )
+                continue
+
+            remaining = max(total_cpu_time - max_amp_cpu_time, 0.0)
+            avg_other = remaining / max(num_active_amps - 1, 1)
+            expanded_rows.append(
+                {
+                    "query_id": query_id,
+                    "step_id": step_id,
+                    "amp_id": amp_id,
+                    "cpu_time": max_amp_cpu_time,
+                    "start_time": start_time,
+                }
+            )
+            expanded_rows.append(
+                {
+                    "query_id": query_id,
+                    "step_id": step_id,
+                    "amp_id": 0,
+                    "cpu_time": avg_other,
+                    "start_time": start_time,
+                }
+            )
+        return pd.DataFrame(expanded_rows)
+
+    def table_stats(self) -> pd.DataFrame:
+        where = ""
+        if self.demo_schema.strip():
+            where = f" WHERE UPPER(DatabaseName) = '{self.demo_schema.strip().upper()}'"
+        sql = f"""
+            SELECT
+                DataBaseName AS database_name,
+                TableName AS table_name,
+                CAST(0 AS BIGINT) AS row_count,
+                LastAlterTimeStamp AS last_collect_stats
+            FROM {self.table_stats_table}
+            {where}
+        """
+        return pd.read_sql(sql, self.conn)
+
+
+class ScenarioStore(ABC):
+    @abstractmethod
+    def initialize_schema(self, schema_paths: list[Path]) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def persist_metrics(self, metrics: pd.DataFrame) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def persist_model_state(
+        self,
+        scenario_id: str,
+        entity_type: str,
+        entity_id: str,
+        trained_at: datetime,
+        baseline: dict[str, Any],
+    ) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def series(self, metric_name: str, entity_type: str | None = None) -> pd.DataFrame:
+        raise NotImplementedError
+
+    @abstractmethod
+    def persist_events(self, events: list[Event]) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def persist_kpis(self, kpis: dict[str, Any]) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def report(self, since_s: str, limit: int) -> tuple[pd.DataFrame, pd.DataFrame]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def commit(self) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def close(self) -> None:
+        raise NotImplementedError
+
+
+class SQLiteScenarioStore(ScenarioStore):
+    def __init__(self, conn: sqlite3.Connection):
+        self.conn = conn
 
     def initialize_schema(self, schema_paths: list[Path]) -> None:
         for path in schema_paths:
             with path.open("r", encoding="utf-8") as f:
                 self.conn.executescript(f.read())
         self.conn.commit()
+
+    def persist_metrics(self, metrics: pd.DataFrame) -> None:
+        if metrics.empty:
+            return
+        sql = """
+            INSERT INTO metric_timeseries(metric_name, entity_type, entity_id, ts, value, tags_json)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(metric_name, entity_type, entity_id, ts)
+            DO UPDATE SET value=excluded.value, tags_json=excluded.tags_json
+        """
+        self.conn.executemany(
+            sql,
+            [(r.metric_name, r.entity_type, r.entity_id, r.ts, r.value, r.tags_json) for r in metrics.itertuples(index=False)],
+        )
+
+    def persist_model_state(
+        self,
+        scenario_id: str,
+        entity_type: str,
+        entity_id: str,
+        trained_at: datetime,
+        baseline: dict[str, Any],
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO model_state(scenario_id, entity_type, entity_id, trained_at, model_blob, baseline_json)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(scenario_id, entity_type, entity_id)
+            DO UPDATE SET trained_at=excluded.trained_at, baseline_json=excluded.baseline_json
+            """,
+            (scenario_id, entity_type, entity_id, trained_at.isoformat(timespec="seconds"), None, json.dumps(baseline, default=_json_default)),
+        )
+
+    def series(self, metric_name: str, entity_type: str | None = None) -> pd.DataFrame:
+        params: list[Any] = [metric_name]
+        sql = "SELECT entity_type, entity_id, ts, value FROM metric_timeseries WHERE metric_name = ?"
+        if entity_type:
+            sql += " AND entity_type = ?"
+            params.append(entity_type)
+        df = pd.read_sql_query(sql, self.conn, params=params)
+        if not df.empty:
+            df["ts"] = pd.to_datetime(df["ts"], utc=True).dt.tz_convert(None)
+            df = df.sort_values(["entity_id", "ts"])
+        return df
+
+    def persist_events(self, events: list[Event]) -> None:
+        if not events:
+            return
+        self.conn.executemany(
+            """
+            INSERT INTO anomaly_events(
+                scenario_id, severity, entity_type, entity_id, ts, observed, expected, score, context_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    e.scenario_id,
+                    e.severity,
+                    e.entity_type,
+                    e.entity_id,
+                    e.ts.isoformat(timespec="seconds"),
+                    e.observed,
+                    e.expected,
+                    e.score,
+                    json.dumps(e.context, default=_json_default),
+                )
+                for e in events
+            ],
+        )
+
+    def persist_kpis(self, kpis: dict[str, Any]) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO impact_kpis(ts_window_start, ts_window_end, cpu_at_risk, io_at_risk, incidents_predicted, cost_risk_index)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(ts_window_start, ts_window_end)
+            DO UPDATE SET
+                cpu_at_risk=excluded.cpu_at_risk,
+                io_at_risk=excluded.io_at_risk,
+                incidents_predicted=excluded.incidents_predicted,
+                cost_risk_index=excluded.cost_risk_index
+            """,
+            (
+                kpis["ts_window_start"],
+                kpis["ts_window_end"],
+                kpis["cpu_at_risk"],
+                kpis["io_at_risk"],
+                kpis["incidents_predicted"],
+                kpis["cost_risk_index"],
+            ),
+        )
+
+    def report(self, since_s: str, limit: int) -> tuple[pd.DataFrame, pd.DataFrame]:
+        events = pd.read_sql_query(
+            """
+            SELECT event_id, scenario_id, severity, entity_type, entity_id, ts, observed, expected, score
+            FROM anomaly_events
+            WHERE ts >= ?
+            ORDER BY ts DESC, severity DESC
+            LIMIT ?
+            """,
+            self.conn,
+            params=[since_s, limit],
+        )
+        kpis = pd.read_sql_query(
+            """
+            SELECT ts_window_start, ts_window_end, cpu_at_risk, io_at_risk, incidents_predicted, cost_risk_index
+            FROM impact_kpis
+            WHERE ts_window_end >= ?
+            ORDER BY ts_window_end DESC
+            LIMIT ?
+            """,
+            self.conn,
+            params=[since_s, limit],
+        )
+        return events, kpis
+
+    def commit(self) -> None:
+        self.conn.commit()
+
+    def close(self) -> None:
+        return
+
+
+class TeradataScenarioStore(ScenarioStore):
+    def __init__(
+        self,
+        conn: Any,
+        *,
+        metric_table: str | None = None,
+        model_state_table: str | None = None,
+        anomaly_table: str | None = None,
+        kpi_table: str | None = None,
+    ):
+        self.conn = conn
+        self.metric_table = metric_table or os.getenv("TD_METRIC_TABLE", "metric_timeseries")
+        self.model_state_table = model_state_table or os.getenv("TD_MODEL_STATE_TABLE", "model_state")
+        self.anomaly_table = anomaly_table or os.getenv("TD_ANOMALY_TABLE", "anomaly_events")
+        self.kpi_table = kpi_table or os.getenv("TD_KPI_TABLE", "impact_kpis")
+
+    def initialize_schema(self, schema_paths: list[Path]) -> None:
+        for path in schema_paths:
+            if path.suffix.lower() != ".sql":
+                continue
+            sql = path.read_text(encoding="utf-8")
+            for stmt in [part.strip() for part in sql.split(";") if part.strip()]:
+                try:
+                    self.conn.cursor().execute(stmt)
+                except Exception:
+                    # Ignore "already exists" and dialect-specific no-op failures.
+                    pass
+        self.conn.commit()
+
+    def persist_metrics(self, metrics: pd.DataFrame) -> None:
+        if metrics.empty:
+            return
+        cur = self.conn.cursor()
+        for r in metrics.itertuples(index=False):
+            cur.execute(
+                f"DELETE FROM {self.metric_table} WHERE metric_name=? AND entity_type=? AND entity_id=? AND ts=?",
+                [r.metric_name, r.entity_type, r.entity_id, r.ts],
+            )
+            cur.execute(
+                f"INSERT INTO {self.metric_table}(metric_name, entity_type, entity_id, ts, metric_value, tags_json) VALUES (?, ?, ?, ?, ?, ?)",
+                [r.metric_name, r.entity_type, r.entity_id, r.ts, r.value, r.tags_json],
+            )
+
+    def persist_model_state(
+        self,
+        scenario_id: str,
+        entity_type: str,
+        entity_id: str,
+        trained_at: datetime,
+        baseline: dict[str, Any],
+    ) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            f"DELETE FROM {self.model_state_table} WHERE scenario_id=? AND entity_type=? AND entity_id=?",
+            [scenario_id, entity_type, entity_id],
+        )
+        cur.execute(
+            f"INSERT INTO {self.model_state_table}(scenario_id, entity_type, entity_id, trained_at, model_blob, baseline_json) VALUES (?, ?, ?, ?, ?, ?)",
+            [scenario_id, entity_type, entity_id, trained_at.isoformat(timespec='seconds'), None, json.dumps(baseline, default=_json_default)],
+        )
+
+    def series(self, metric_name: str, entity_type: str | None = None) -> pd.DataFrame:
+        sql = f"SELECT entity_type, entity_id, ts, metric_value FROM {self.metric_table} WHERE metric_name = ?"
+        params: list[Any] = [metric_name]
+        if entity_type:
+            sql += " AND entity_type = ?"
+            params.append(entity_type)
+        df = pd.read_sql(sql, self.conn, params=params)
+        if not df.empty:
+            df = df.rename(columns={"metric_value": "value"})
+            df["ts"] = pd.to_datetime(df["ts"], utc=True, errors="coerce").dt.tz_convert(None)
+            df = df.sort_values(["entity_id", "ts"])
+        return df
+
+    def persist_events(self, events: list[Event]) -> None:
+        if not events:
+            return
+        cur = self.conn.cursor()
+        for e in events:
+            event_id = f"{e.scenario_id}|{e.entity_type}|{e.entity_id}|{e.ts.isoformat(timespec='seconds')}"
+            cur.execute(f"DELETE FROM {self.anomaly_table} WHERE event_id=?", [event_id])
+            cur.execute(
+                f"INSERT INTO {self.anomaly_table}(event_id, scenario_id, severity, entity_type, entity_id, ts, observed, expected, score, context_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    event_id,
+                    e.scenario_id,
+                    e.severity,
+                    e.entity_type,
+                    e.entity_id,
+                    e.ts.isoformat(timespec="seconds"),
+                    e.observed,
+                    e.expected,
+                    e.score,
+                    json.dumps(e.context, default=_json_default),
+                ],
+            )
+
+    def persist_kpis(self, kpis: dict[str, Any]) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            f"DELETE FROM {self.kpi_table} WHERE ts_window_start=? AND ts_window_end=?",
+            [kpis["ts_window_start"], kpis["ts_window_end"]],
+        )
+        cur.execute(
+            f"INSERT INTO {self.kpi_table}(ts_window_start, ts_window_end, cpu_at_risk, io_at_risk, incidents_predicted, cost_risk_index) VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                kpis["ts_window_start"],
+                kpis["ts_window_end"],
+                kpis["cpu_at_risk"],
+                kpis["io_at_risk"],
+                kpis["incidents_predicted"],
+                kpis["cost_risk_index"],
+            ],
+        )
+
+    def report(self, since_s: str, limit: int) -> tuple[pd.DataFrame, pd.DataFrame]:
+        events = pd.read_sql(
+            f"""
+            SELECT event_id, scenario_id, severity, entity_type, entity_id, ts, observed, expected, score
+            FROM {self.anomaly_table}
+            WHERE ts >= ?
+            ORDER BY ts DESC
+            QUALIFY ROW_NUMBER() OVER (ORDER BY ts DESC) <= ?
+            """,
+            self.conn,
+            params=[since_s, limit],
+        )
+        kpis = pd.read_sql(
+            f"""
+            SELECT ts_window_start, ts_window_end, cpu_at_risk, io_at_risk, incidents_predicted, cost_risk_index
+            FROM {self.kpi_table}
+            WHERE ts_window_end >= ?
+            ORDER BY ts_window_end DESC
+            QUALIFY ROW_NUMBER() OVER (ORDER BY ts_window_end DESC) <= ?
+            """,
+            self.conn,
+            params=[since_s, limit],
+        )
+        return events, kpis
+
+    def commit(self) -> None:
+        self.conn.commit()
+
+    def close(self) -> None:
+        self.conn.close()
+
+
+class ScenarioEngine:
+    def __init__(
+        self,
+        conn: Any,
+        source: TelemetrySource,
+        store: ScenarioStore,
+        window_min: int,
+        lookback_days: int,
+    ):
+        self.conn = conn
+        self.source = source
+        self.store = store
+        self.window_min = window_min
+        self.lookback_days = lookback_days
+        self.period_day = int((24 * 60) / self.window_min)
+
+    def initialize_schema(self, schema_paths: list[Path]) -> None:
+        self.store.initialize_schema(schema_paths)
 
     def run_once(self, run_at: datetime) -> dict[str, Any]:
         run_at = to_naive_utc(run_at)
@@ -203,7 +673,7 @@ class ScenarioEngine:
         kpis = self._compute_impact_kpis(window_start, window_end, events)
         self._persist_kpis(kpis)
 
-        self.conn.commit()
+        self.store.commit()
         return {
             "window_start": window_start.isoformat(timespec="seconds"),
             "window_end": window_end.isoformat(timespec="seconds"),
@@ -234,11 +704,43 @@ class ScenarioEngine:
 
             w_cpu = df_q.groupby(["bucket", "workload_name"], as_index=False)["amp_cpu_time"].sum()
             for r in w_cpu.itertuples(index=False):
-                rows.append(self._metric_row("workload_cpu_usage", "workload", str(r.workload_name), r.bucket, float(r.amp_cpu_time), {}))
+                top_queries = (
+                    df_q[(df_q["bucket"] == r.bucket) & (df_q["workload_name"] == r.workload_name)]
+                    .sort_values("amp_cpu_time", ascending=False)["query_id"]
+                    .head(5)
+                    .astype(str)
+                    .tolist()
+                )
+                rows.append(
+                    self._metric_row(
+                        "workload_cpu_usage",
+                        "workload",
+                        str(r.workload_name),
+                        r.bucket,
+                        float(r.amp_cpu_time),
+                        {"top_query_ids": top_queries},
+                    )
+                )
 
             w_io = df_q.groupby(["bucket", "workload_name"], as_index=False)["io_count"].sum()
             for r in w_io.itertuples(index=False):
-                rows.append(self._metric_row("workload_io_count", "workload", str(r.workload_name), r.bucket, float(r.io_count), {}))
+                top_queries = (
+                    df_q[(df_q["bucket"] == r.bucket) & (df_q["workload_name"] == r.workload_name)]
+                    .sort_values("io_count", ascending=False)["query_id"]
+                    .head(5)
+                    .astype(str)
+                    .tolist()
+                )
+                rows.append(
+                    self._metric_row(
+                        "workload_io_count",
+                        "workload",
+                        str(r.workload_name),
+                        r.bucket,
+                        float(r.io_count),
+                        {"top_query_ids": top_queries},
+                    )
+                )
 
             w_agg = df_q.groupby(["bucket", "workload_name"], as_index=False).agg(
                 io_sum=("io_count", "sum"),
@@ -267,7 +769,7 @@ class ScenarioEngine:
             df_s = df_s.copy()
             df_s["start_time"] = pd.to_datetime(df_s["start_time"], utc=True).dt.tz_convert(None)
             df_s["bucket"] = df_s["start_time"].dt.floor(f"{self.window_min}min")
-            g = df_s.groupby(["bucket", "step_id"], as_index=False).agg(
+            g = df_s.groupby(["bucket", "query_id", "step_id"], as_index=False).agg(
                 max_cpu=("cpu_time", "max"),
                 avg_cpu=("cpu_time", "mean"),
             )
@@ -275,9 +777,18 @@ class ScenarioEngine:
                 lambda x: float(x["max_cpu"] / x["avg_cpu"]) if x["avg_cpu"] else 0.0,
                 axis=1,
             )
-            g["entity_id"] = "step:" + g["step_id"].astype(str)
+            g["entity_id"] = "query:" + g["query_id"].astype(str) + "|step:" + g["step_id"].astype(str)
             for r in g.itertuples(index=False):
-                rows.append(self._metric_row("skew_ratio", "query_step", str(r.entity_id), r.bucket, float(r.skew_ratio), {}))
+                rows.append(
+                    self._metric_row(
+                        "skew_ratio",
+                        "query_step",
+                        str(r.entity_id),
+                        r.bucket,
+                        float(r.skew_ratio),
+                        {"query_id": str(r.query_id), "step_id": str(r.step_id)},
+                    )
+                )
 
         if not df_t.empty:
             for r in df_t.itertuples(index=False):
@@ -298,28 +809,7 @@ class ScenarioEngine:
         }
 
     def _persist_metrics(self, metrics: pd.DataFrame) -> None:
-        if metrics.empty:
-            return
-        sql = """
-            INSERT INTO metric_timeseries(metric_name, entity_type, entity_id, ts, value, tags_json)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(metric_name, entity_type, entity_id, ts)
-            DO UPDATE SET value=excluded.value, tags_json=excluded.tags_json
-        """
-        self.conn.executemany(
-            sql,
-            [
-                (
-                    r.metric_name,
-                    r.entity_type,
-                    r.entity_id,
-                    r.ts,
-                    r.value,
-                    r.tags_json,
-                )
-                for r in metrics.itertuples(index=False)
-            ],
-        )
+        self.store.persist_metrics(metrics)
     def _persist_model_state(
         self,
         scenario_id: str,
@@ -328,34 +818,10 @@ class ScenarioEngine:
         trained_at: datetime,
         baseline: dict[str, Any],
     ) -> None:
-        self.conn.execute(
-            """
-            INSERT INTO model_state(scenario_id, entity_type, entity_id, trained_at, model_blob, baseline_json)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(scenario_id, entity_type, entity_id)
-            DO UPDATE SET trained_at=excluded.trained_at, baseline_json=excluded.baseline_json
-            """,
-            (
-                scenario_id,
-                entity_type,
-                entity_id,
-                trained_at.isoformat(timespec="seconds"),
-                None,
-                json.dumps(baseline, default=_json_default),
-            ),
-        )
+        self.store.persist_model_state(scenario_id, entity_type, entity_id, trained_at, baseline)
 
     def _series(self, metric_name: str, entity_type: str | None = None) -> pd.DataFrame:
-        params: list[Any] = [metric_name]
-        sql = "SELECT entity_type, entity_id, ts, value FROM metric_timeseries WHERE metric_name = ?"
-        if entity_type:
-            sql += " AND entity_type = ?"
-            params.append(entity_type)
-        df = pd.read_sql_query(sql, self.conn, params=params)
-        if not df.empty:
-            df["ts"] = pd.to_datetime(df["ts"], utc=True).dt.tz_convert(None)
-            df = df.sort_values(["entity_id", "ts"])
-        return df
+        return self.store.series(metric_name, entity_type)
 
     def _seasonal_expected(self, values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         n = len(values)
@@ -663,8 +1129,18 @@ class ScenarioEngine:
         if s.empty:
             return out
 
-        for entity, group in s.groupby("entity_id"):
-            g = group.sort_values("ts")
+        s = s.copy()
+        s["step_key"] = s["entity_id"].astype(str).str.extract(r"(step:\d+)")
+        s["latest_entity"] = s["entity_id"].astype(str)
+        for entity, group in s.groupby("step_key"):
+            if not entity:
+                continue
+            g = (
+                group.sort_values(["ts", "value"], ascending=[True, False])
+                .groupby("ts", as_index=False)
+                .agg(value=("value", "max"), entity_id=("latest_entity", "first"))
+                .sort_values("ts")
+            )
             vals = g["value"].to_numpy(dtype=float)
             if len(vals) < 3:
                 continue
@@ -679,17 +1155,18 @@ class ScenarioEngine:
             if latest_ts != window_end - timedelta(minutes=self.window_min):
                 continue
             if vals[-1] > 5.0 and vals[-1] > vals[-2] > vals[-3]:
+                latest_entity = str(g["entity_id"].iloc[-1])
                 out.append(
                     Event(
                         scenario_id="S7",
                         severity="high",
                         entity_type="query_step",
-                        entity_id=str(entity),
+                        entity_id=latest_entity,
                         ts=window_end,
                         observed=float(vals[-1]),
                         expected=float(np.mean(vals[-3:-1])),
                         score=float(vals[-1]),
-                        context={"trend": vals[-3:].tolist()},
+                        context={"trend": vals[-3:].tolist(), "step_key": str(entity)},
                     )
                 )
         return out
@@ -720,29 +1197,7 @@ class ScenarioEngine:
                 )
 
     def _persist_events(self, events: list[Event]) -> None:
-        if not events:
-            return
-        self.conn.executemany(
-            """
-            INSERT INTO anomaly_events(
-                scenario_id, severity, entity_type, entity_id, ts, observed, expected, score, context_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                (
-                    e.scenario_id,
-                    e.severity,
-                    e.entity_type,
-                    e.entity_id,
-                    e.ts.isoformat(timespec="seconds"),
-                    e.observed,
-                    e.expected,
-                    e.score,
-                    json.dumps(e.context, default=_json_default),
-                )
-                for e in events
-            ],
-        )
+        self.store.persist_events(events)
 
     def _compute_impact_kpis(self, window_start: datetime, window_end: datetime, events: list[Event]) -> dict[str, Any]:
         cpu_risk = 0.0
@@ -771,41 +1226,50 @@ class ScenarioEngine:
         }
 
     def _persist_kpis(self, kpis: dict[str, Any]) -> None:
-        self.conn.execute(
-            """
-            INSERT INTO impact_kpis(ts_window_start, ts_window_end, cpu_at_risk, io_at_risk, incidents_predicted, cost_risk_index)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(ts_window_start, ts_window_end)
-            DO UPDATE SET
-                cpu_at_risk=excluded.cpu_at_risk,
-                io_at_risk=excluded.io_at_risk,
-                incidents_predicted=excluded.incidents_predicted,
-                cost_risk_index=excluded.cost_risk_index
-            """,
-            (
-                kpis["ts_window_start"],
-                kpis["ts_window_end"],
-                kpis["cpu_at_risk"],
-                kpis["io_at_risk"],
-                kpis["incidents_predicted"],
-                kpis["cost_risk_index"],
-            ),
-        )
+        self.store.persist_kpis(kpis)
+
+def build_source(args: argparse.Namespace, sink_conn: sqlite3.Connection) -> TelemetrySource:
+    if args.source == "sqlite":
+        return SQLiteSource(sink_conn)
+    return TeradataSource(
+        connect_teradata(),
+        dbql_query_table=args.td_dbql_query_table,
+        dbql_step_table=args.td_dbql_step_table,
+        resusage_table=args.td_resusage_table,
+        table_stats_table=args.td_tables_table,
+    )
+
+
+def build_store(args: argparse.Namespace, sqlite_conn: sqlite3.Connection) -> ScenarioStore:
+    if args.sink == "sqlite":
+        return SQLiteScenarioStore(sqlite_conn)
+    return TeradataScenarioStore(
+        connect_teradata(),
+        metric_table=args.td_metric_table,
+        model_state_table=args.td_model_state_table,
+        anomaly_table=args.td_anomaly_table,
+        kpi_table=args.td_kpi_table,
+    )
+
 
 def cmd_run(args: argparse.Namespace) -> None:
     db_path = Path(args.db)
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     with sqlite3.connect(db_path) as conn:
-        source = SQLiteSource(conn)
-        engine = ScenarioEngine(conn, source, args.window_min, args.lookback_days)
+        source = build_source(args, conn)
+        store = build_store(args, conn)
+        engine = ScenarioEngine(conn, source, store, args.window_min, args.lookback_days)
         engine.initialize_schema([
             Path(args.schema),
-            Path(args.scenario_schema),
+            Path(args.vantage_scenario_schema if args.sink == "teradata" else args.scenario_schema),
         ])
         run_at = parse_iso_datetime(args.at) if args.at else datetime.now(UTC)
         summary = engine.run_once(run_at)
         print(json.dumps(summary, indent=2))
+        if isinstance(source, TeradataSource):
+            source.conn.close()
+        store.close()
 
 
 def cmd_backfill(args: argparse.Namespace) -> None:
@@ -818,11 +1282,12 @@ def cmd_backfill(args: argparse.Namespace) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     with sqlite3.connect(db_path) as conn:
-        source = SQLiteSource(conn)
-        engine = ScenarioEngine(conn, source, args.window_min, args.lookback_days)
+        source = build_source(args, conn)
+        store = build_store(args, conn)
+        engine = ScenarioEngine(conn, source, store, args.window_min, args.lookback_days)
         engine.initialize_schema([
             Path(args.schema),
-            Path(args.scenario_schema),
+            Path(args.vantage_scenario_schema if args.sink == "teradata" else args.scenario_schema),
         ])
 
         cur = floor_window(to_naive_utc(start), args.window_min)
@@ -835,6 +1300,9 @@ def cmd_backfill(args: argparse.Namespace) -> None:
             runs += 1
 
         print(json.dumps({"backfill_runs": runs}, indent=2))
+        if isinstance(source, TeradataSource):
+            source.conn.close()
+        store.close()
 
 
 def cmd_report(args: argparse.Namespace) -> None:
@@ -842,28 +1310,9 @@ def cmd_report(args: argparse.Namespace) -> None:
     since_s = to_naive_utc(since).isoformat(timespec="seconds")
 
     with sqlite3.connect(args.db) as conn:
-        events = pd.read_sql_query(
-            """
-            SELECT event_id, scenario_id, severity, entity_type, entity_id, ts, observed, expected, score
-            FROM anomaly_events
-            WHERE ts >= ?
-            ORDER BY ts DESC, severity DESC
-            LIMIT ?
-            """,
-            conn,
-            params=[since_s, args.limit],
-        )
-        kpis = pd.read_sql_query(
-            """
-            SELECT ts_window_start, ts_window_end, cpu_at_risk, io_at_risk, incidents_predicted, cost_risk_index
-            FROM impact_kpis
-            WHERE ts_window_end >= ?
-            ORDER BY ts_window_end DESC
-            LIMIT ?
-            """,
-            conn,
-            params=[since_s, args.limit],
-        )
+        store = build_store(args, conn)
+        events, kpis = store.report(since_s, args.limit)
+        store.close()
 
     print("\n=== Recent Anomaly Events ===")
     if events.empty:
@@ -883,8 +1332,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--db", default="data/telemetry.db", help="SQLite database path")
     parser.add_argument("--schema", default="schema/minimal_telemetry.sql", help="Base telemetry schema path")
     parser.add_argument("--scenario-schema", default="schema/scenario_tables.sql", help="Scenario schema path")
+    parser.add_argument("--vantage-scenario-schema", default="schema/scenario_tables_vantage.sql", help="Vantage scenario schema path")
     parser.add_argument("--window-min", type=int, default=15, help="Window size in minutes")
     parser.add_argument("--lookback-days", type=int, default=30, help="Lookback used for model fit")
+    parser.add_argument("--source", choices=["sqlite", "teradata"], default="sqlite", help="Telemetry source type")
+    parser.add_argument("--sink", choices=["sqlite", "teradata"], default="sqlite", help="Scenario output sink type")
+    parser.add_argument("--td-dbql-query-table", help="Override DBQL query log object name")
+    parser.add_argument("--td-dbql-step-table", help="Override DBQL step object name")
+    parser.add_argument("--td-resusage-table", help="Override ResUsage object name")
+    parser.add_argument("--td-tables-table", help="Override table stats object name")
+    parser.add_argument("--td-metric-table", help="Override Vantage metric output table name")
+    parser.add_argument("--td-model-state-table", help="Override Vantage model state table name")
+    parser.add_argument("--td-anomaly-table", help="Override Vantage anomaly event table name")
+    parser.add_argument("--td-kpi-table", help="Override Vantage KPI table name")
 
     sub = parser.add_subparsers(dest="command", required=True)
 
